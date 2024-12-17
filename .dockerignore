@@ -1,0 +1,7 @@
+/*.csv
+/*.sh
+/.dockerignore
+/.gitignore
+/.vscode/
+/Dockerfile
+/py/

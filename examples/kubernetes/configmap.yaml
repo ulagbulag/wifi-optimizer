@@ -1,0 +1,15 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wifi-optimizer
+  namespace: wifi-optimizer
+data:
+  sources.csv: |
+    kind,id,x,y
+    desktop,(my-machine-uuid),0,0
+    desktop,f1ba76c3-6c5b-4f19-bf8c-f71363052a9f,2,3
+  targets.csv: |
+    kind,id,x,y
+    ap,(my-ap-mac-address),0,0
+    ap,12:34:56:78:9A:BC,3,4

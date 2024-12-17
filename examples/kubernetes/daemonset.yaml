@@ -1,0 +1,38 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: wifi-optimizer
+  namespace: wifi-optimizer
+spec:
+  selector:
+    matchLabels:
+      app: wifi-optimizer
+  template:
+    metadata:
+      labels:
+        app: wifi-optimizer
+    spec:
+      containers:
+        - name: wifi-optimizer
+          image: quay.io/ulagbulag/wifi-optimizer:latest
+          imagePullPolicy: Always
+          securityContext:
+            capabilities:
+              add:
+                - apparmor:unconfined
+                - seccomp:unconfined
+            privileged: true
+          volumeMounts:
+            - name: scripts
+              mountPath: /src/sources.csv
+              subPath: sources.csv
+            - name: scripts
+              mountPath: /src/targets.csv
+              subPath: targets.csv
+      hostNetwork: true
+      terminationGracePeriodSeconds: 5
+      volumes:
+        - name: scripts
+          configMap:
+            name: wifi-optimizer
