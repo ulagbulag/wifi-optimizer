@@ -43,7 +43,6 @@ def _get_system_uuid() -> str:
         stdin=None,
         stderr=sys.stderr,
     )
-    print(outputs.decode('utf-8').strip())
     return outputs.decode('utf-8').strip()
 
 
@@ -174,8 +173,8 @@ class _AccessPointSelector:
 
         source = self._sources[index_source]
         logger.info('Node info\n%s', repr(source))
-        self._x: float = source['x'][0]
-        self._y: float = source['y'][0]
+        self._x: float = source['x'].item()
+        self._y: float = source['y'].item()
 
     def _fit_target(self, bssid: str) -> int | None:
         macs = [
@@ -188,7 +187,7 @@ class _AccessPointSelector:
             for index, mac in enumerate(macs)
             if pattern[1:-1] == mac[1:-1]
             if abs(pattern[0] - mac[0]) in [0, 8]
-            if pattern[-1] - mac[-1] < 16
+            if pattern[-1] - mac[-1] >= 0 and pattern[-1] - mac[-1] < 16
         ]
         if not filtered:
             return None
@@ -207,11 +206,12 @@ class _AccessPointSelector:
             self._fit_target(bssid)
             for bssid in bssids
         ]
-        targets = self._targets.iloc[[
+        targets = pd.DataFrame(self._targets.iloc[[
             index
             for index in target_indices
             if index is not None
-        ]]
+        ]])
+        targets = targets.reset_index(inplace=False, drop=True)
 
         # Concat the BSSIDs into the targets
         series_bssid = pd.Series([
@@ -219,7 +219,7 @@ class _AccessPointSelector:
             for index, bssid in zip(target_indices, bssids)
             if index is not None
         ])
-        targets['bssid'] = series_bssid
+        targets.loc[:, ['bssid']] = series_bssid
         logger.debug('Available APs\n%s', repr(targets))
 
         # Find the nearest AP
@@ -228,7 +228,7 @@ class _AccessPointSelector:
         series_l2_dist = np.sqrt(
             series_diff_x ** 2 + series_diff_y ** 2  # type: ignore
         )
-        nearest_ap_index = np.argmin(series_l2_dist)
+        nearest_ap_index = np.argmin(series_l2_dist).item()
 
         # Return the nearest AP's BSSID
         return targets['bssid'][nearest_ap_index]  # type: ignore
@@ -254,6 +254,9 @@ def _main() -> None:
     ssid_str = ssid.decode('utf-8')
     logger.info('Find BSSIDs: %s', ssid_str)
 
+    dry_run = os.environ.get('DRY_RUN', 'false') == 'true'
+    interval_secs = float(os.environ.get('INTERVAL_SECS', '30'))
+
     def _update_bssid(bssid: str | None) -> None:
         if bssid is not None:
             logger.debug('Switch BSSID to: %s', bssid)
@@ -268,12 +271,12 @@ def _main() -> None:
             wireless.bssid = None
 
         logger.debug('Update wifi profile')
-        connection.update_profile(profile, save_to_disk=False)
-        nm.activate_connection(
-            connection=connection_path,
-        )
+        if not dry_run:
+            connection.update_profile(profile, save_to_disk=False)
+            nm.activate_connection(
+                connection=connection_path,
+            )
 
-    interval_secs = float(os.environ.get('INTERVAL_SECS', '30'))
     while True:
         bssids = _find_bssids(device, ssid)
         logger.debug('Detected BSSIDs: %s', repr(bssids))

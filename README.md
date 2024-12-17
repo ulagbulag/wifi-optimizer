@@ -43,6 +43,7 @@ sudo docker run --privileged \
 - DEBUG: Whether to show debug logs (default: false)
 - SRC_FILE: The `sources.csv` file path (default: sources.csv)
 - TGT_FILE: The `targets.csv` file path (default: targets.csv)
+- DRY_RUN: Whether to change BSSID virtaully (default: false)
 - INTERVAL_SECS: The interval of updating BSSID as seconds (default: 30)
 
 ## Deploy on the K8S

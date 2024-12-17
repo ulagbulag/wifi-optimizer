@@ -17,6 +17,13 @@ spec:
         - name: wifi-optimizer
           image: quay.io/ulagbulag/wifi-optimizer:latest
           imagePullPolicy: Always
+          env:
+            - name: DEBUG
+              value: "true"
+            - name: DRY_RUN
+              value: "true"
+            - name: INTERVAL_SECS
+              value: "30"
           securityContext:
             capabilities:
               add:
@@ -27,12 +34,21 @@ spec:
             - name: scripts
               mountPath: /src/sources.csv
               subPath: sources.csv
+              readOnly: true
             - name: scripts
               mountPath: /src/targets.csv
               subPath: targets.csv
+              readOnly: true
+            - name: system-dbus
+              mountPath: /run/dbus
+              readOnly: true
       hostNetwork: true
       terminationGracePeriodSeconds: 5
       volumes:
+        - name: system-dbus
+          hostPath:
+            path: /run/dbus
+            type: Directory
         - name: scripts
           configMap:
             name: wifi-optimizer
