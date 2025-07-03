@@ -24,6 +24,8 @@ spec:
               value: "true"
             - name: INTERVAL_SECS
               value: "30"
+            - name: ONE_SHOT
+              value: "true"
           securityContext:
             capabilities:
               add:

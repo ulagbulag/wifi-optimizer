@@ -45,6 +45,7 @@ sudo docker run --privileged \
 - TGT_FILE: The `targets.csv` file path (default: targets.csv)
 - DRY_RUN: Whether to change BSSID virtaully (default: false)
 - INTERVAL_SECS: The interval of updating BSSID as seconds (default: 30)
+- ONE_SHOT: Whether to change BSSID at one-time (default: false)
 
 ## Deploy on the K8S
 

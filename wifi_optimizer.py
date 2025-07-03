@@ -228,6 +228,8 @@ class _AccessPointSelector:
         series_l2_dist = np.sqrt(
             series_diff_x ** 2 + series_diff_y ** 2  # type: ignore
         )
+        if series_l2_dist.empty:
+            return None
         nearest_ap_index = np.argmin(series_l2_dist).item()
 
         # Return the nearest AP's BSSID
@@ -256,6 +258,7 @@ def _main() -> None:
 
     dry_run = os.environ.get('DRY_RUN', 'false') == 'true'
     interval_secs = float(os.environ.get('INTERVAL_SECS', '30'))
+    one_shot = os.environ.get('ONE_SHOT', 'false') == 'true'
 
     def _update_bssid(bssid: str | None) -> None:
         if bssid is not None:
@@ -277,6 +280,7 @@ def _main() -> None:
                 connection=connection_path,
             )
 
+    last_bssid = None
     while True:
         bssids = _find_bssids(device, ssid)
         logger.debug('Detected BSSIDs: %s', repr(bssids))
@@ -285,20 +289,26 @@ def _main() -> None:
         bssid = selector.find(bssids)
         _update_bssid(bssid)
 
-        # Revert on failure
-        if bssid is not None:
-            active_connections = []
-            for path in iter(nm.active_connections):
-                try:
-                    active_connections.append(
-                        ActiveConnection(path).connection
-                    )
-                except DbusUnknownMethodError:
-                    pass
-            if connection_path in active_connections:
-                logger.debug('Succeeded switching BSSID')
-            else:
-                _update_bssid(None)
+        # Skip if already changed
+        if not one_shot or bssid is None or last_bssid is None:
+            # Revert on failure
+            if bssid is not None:
+                active_connections = []
+                for path in iter(nm.active_connections):
+                    try:
+                        active_connections.append(
+                            ActiveConnection(path).connection
+                        )
+                    except DbusUnknownMethodError:
+                        pass
+                if connection_path in active_connections:
+                    logger.debug('Succeeded switching BSSID')
+                    last_bssid = bssid
+                else:
+                    _update_bssid(None)
+                    last_bssid = None
+        else:
+            logger.debug('Keeped the original BSSID: %s', last_bssid)
 
         logger.debug('Waiting for %.02f seconds...', interval_secs)
         sleep(interval_secs)
