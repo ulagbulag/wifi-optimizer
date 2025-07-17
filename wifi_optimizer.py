@@ -5,6 +5,7 @@ import binascii
 import logging
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from threading import Event
@@ -29,6 +30,9 @@ from sdbus_block.networkmanager.settings import (
 )
 
 logger = logging.getLogger('wifi_optimizer')
+profile_pattern = re.compile(
+    r'^(/[0-9a-zA-Z-]+)+/[1-9][0-9]*-kiss-enable-[a-z0-9]+.nmconnection$'
+)
 
 
 def _halt() -> NoReturn:
@@ -72,9 +76,15 @@ def _find_device(
         NetworkConnectionSettings(path)
         for path in connection_paths
     ]
+    print([
+        connection.filename
+        for connection in connections
+        if profile_pattern.match(connection.filename)
+    ])
     profiles = [
         connection.get_profile()
         for connection in connections
+        if profile_pattern.match(connection.filename)
     ]
     wifi_indices = [
         index
