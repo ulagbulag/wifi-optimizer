@@ -31,7 +31,7 @@ from sdbus_block.networkmanager.settings import (
 
 logger = logging.getLogger('wifi_optimizer')
 profile_pattern = re.compile(
-    r'^(/[0-9a-zA-Z-]+)+/[1-9][0-9]*-kiss-enable-[a-z0-9]+.nmconnection$'
+    r'^(/[0-9a-zA-Z-]+)+/[1-9][0-9]*-kiss-enable-[0-9a-zA-Z]+.nmconnection$'
 )
 
 
