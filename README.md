@@ -46,6 +46,12 @@ sudo docker run --privileged \
 - DRY_RUN: Whether to change BSSID virtaully (default: false)
 - INTERVAL_SECS: The interval of updating BSSID as seconds (default: 30)
 - ONE_SHOT: Whether to change BSSID at one-time (default: false)
+- BACKEND: How to apply the chosen BSSID (default: `nm`)
+  - `nm`: edit and re-activate the NetworkManager connection profile.
+  - `wpa` (aliases: `wpa_supplicant`, `supplicant`): ask wpa_supplicant to
+    roam over D-Bus without touching NM profiles. Avoids the duplicate
+    connection / bond-master teardown / cannot-reactivate problems of the
+    `nm` backend. Requires wpa_supplicant >= 2.10 (D-Bus `Roam`).
 
 ## Deploy on the K8S
 

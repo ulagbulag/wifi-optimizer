@@ -15,10 +15,25 @@ from typing import NoReturn
 import numpy as np
 import pandas as pd
 import sdbus
-from sdbus.dbus_exceptions import DbusUnknownMethodError
+try:
+    # Base class of EVERY error sdbus can raise: mapped NetworkManager errors,
+    # generic D-Bus transport errors (NoReply/Timeout/Disconnected/AccessDenied
+    # /UnknownMethod) and unmapped error names. NetworkManagerBaseError alone
+    # does NOT cover the transport/unmapped ones, which are exactly what is
+    # raised on an NM restart or a wedged device. The import path differs
+    # between sdbus releases.
+    from sdbus import SdBusBaseError
+except ImportError:  # pragma: no cover - depends on sdbus version
+    from sdbus.dbus_exceptions import SdBusBaseError
+from sdbus import (
+    DbusInterfaceCommon,
+    dbus_method,
+    dbus_property,
+)
 from sdbus_block.networkmanager import (
     AccessPoint,
     ActiveConnection,
+    DeviceState,
     NetworkConnectionSettings,
     NetworkDeviceWireless,
     NetworkManager,
@@ -56,6 +71,7 @@ def _find_device(
     str,
     NetworkConnectionSettings,
     ConnectionProfile,
+    str,
     NetworkDeviceWireless,
 ]:
     logger.info('Inspect the primary connection')
@@ -109,13 +125,15 @@ def _find_device(
         profiles[index]
         for index in wifi_indices
     ]
-    devices = [
-        NetworkDeviceWireless(
-            nm.get_device_by_ip_iface(profile.connection.interface_name)
-        )
+    device_paths = [
+        nm.get_device_by_ip_iface(profile.connection.interface_name)
         for profile in profiles
         # already checked on `wifi_indices`
         if profile.connection.interface_name is not None
+    ]
+    devices = [
+        NetworkDeviceWireless(device_path)
+        for device_path in device_paths
     ]
     logger.info('Found wifi interfaces: %s', repr([
         profile.connection.interface_name
@@ -128,42 +146,52 @@ def _find_device(
         connection_path = connection_paths[selected_index]
         connection = connections[selected_index]
         profile = profiles[selected_index]
+        device_path = device_paths[selected_index]
         device = devices[selected_index]
         logger.info('Selected interface: %s', device.interface)
     except IndexError:
         logger.info('No available wifi interfaces; sleeping...')
         return _halt()
-    return connection_path, connection, profile, device
+    return connection_path, connection, profile, device_path, device
 
 
 def _find_bssids(
     device: NetworkDeviceWireless,
     ssid: bytes,
-) -> list[str]:
+) -> tuple[list[str], dict[str, str]]:
     logger.debug('Rescan APs')
     device.request_scan(
         options={
             'ssids': ('aay', [ssid]),
         },
     )
+    ap_paths = list(device.access_points)
     aps = [
-        AccessPoint(path)
-        for path in device.access_points
+        (path, AccessPoint(path))
+        for path in ap_paths
     ]
     aps = [
-        ap
-        for ap in aps
+        (path, ap)
+        for path, ap in aps
         if ap.ssid == ssid
     ]
     max_bitrate = max(
         ap.max_bitrate
-        for ap in aps
+        for _, ap in aps
     )
-    return [
+    # Map the normalized BSSID to its AP object path so that activation
+    # can pin the exact AP via `specific_object` (instead of letting
+    # NetworkManager pick/generate one).
+    bssid_to_ap_path = {
+        ap.hw_address.upper(): path
+        for path, ap in aps
+    }
+    bssids = [
         ap.hw_address
-        for ap in aps
+        for _, ap in aps
         if ap.max_bitrate == max_bitrate
     ]
+    return bssids, bssid_to_ap_path
 
 
 class _AccessPointSelector:
@@ -246,9 +274,353 @@ class _AccessPointSelector:
         return targets['bssid'][nearest_ap_index]  # type: ignore
 
 
+def _persist_profile(
+    connection: NetworkConnectionSettings,
+    profile: ConnectionProfile,
+) -> None:
+    '''Persist the profile to disk under its existing UUID.
+
+    Writing with `save_to_disk=True` maps to Update2(flags=0x1 TO_DISK), which
+    overwrites the single keyfile in place keeping the same UUID, never relies
+    on volatile in-memory storage that NetworkManager can garbage-collect, and
+    (because BLOCK_AUTOCONNECT is not set) also clears any autoconnect-blocked
+    reason so a flapping link can re-arm itself.
+    '''
+    # Never echo back server-managed fields; sending `read-only`/a stale
+    # `timestamp` back is at best ignored and at worst rejected/normalized.
+    profile.connection.timestamp = None
+    profile.connection.read_only = None
+    connection.update_profile(profile, save_to_disk=True)
+
+
+def _activate(
+    nm: NetworkManager,
+    connection_path: str,
+    device_path: str,
+    ap_path: str,
+) -> None:
+    '''Re-activate the EXISTING profile, pinned to the device and target AP.
+
+    Passing the real connection path plus an explicit device and AP object path
+    guarantees NetworkManager re-associates THIS profile (same UUID) to the
+    chosen BSSID and never has to pick/generate a device or fork a new
+    connection. We intentionally do NOT use Device.Reapply: for an 802-11
+    bssid change Reapply may return success without actually re-associating to
+    the new AP, which would silently defeat the optimizer.
+    '''
+    nm.activate_connection(
+        connection=connection_path,
+        device=device_path,
+        specific_object=ap_path,
+    )
+
+
+def _recover_device(
+    nm: NetworkManager,
+    connection: NetworkConnectionSettings,
+    profile: ConnectionProfile,
+    connection_path: str,
+    device_path: str,
+    device: NetworkDeviceWireless,
+) -> None:
+    '''Bring the slave back up after a link drop without an NM restart.
+
+    Re-arm autoconnect by persisting TO_DISK (no BLOCK_AUTOCONNECT clears the
+    blocked reason and resets the retry counter), then re-activate the existing
+    profile explicitly. Never call Device.Disconnect (it blocks autoconnect)
+    and never touch the bond master.
+    '''
+    try:
+        # The device path can go stale (e.g. the bond/device was torn down),
+        # in which case reading the property raises a D-Bus error, not just a
+        # ValueError. Never let that crash the daemon.
+        state = DeviceState(device.state)
+    except ValueError:
+        return
+    except SdBusBaseError as error:
+        logger.warning('Failed to read device state: %s', error)
+        return
+    # Only recover from terminal "down" states; leave in-progress
+    # transitions (PREPARE/CONFIG/IP_CONFIG/NEED_AUTH/...) alone so we do
+    # not fight an activation that NetworkManager is already driving.
+    if state not in (
+        DeviceState.UNAVAILABLE,
+        DeviceState.DISCONNECTED,
+        DeviceState.FAILED,
+    ):
+        return
+
+    logger.info('Recovering wifi device from state: %s', state)
+    try:
+        # The profile still carries the last selected bssid, so re-activating
+        # it re-pins to that AP (specific_object='/' adds no extra constraint).
+        _persist_profile(connection, profile)
+        nm.activate_connection(
+            connection=connection_path,
+            device=device_path,
+            specific_object='/',
+        )
+    except SdBusBaseError as error:
+        logger.warning('Recovery activation failed: %s', error)
+
+
+WPA_SERVICE_NAME = 'fi.w1.wpa_supplicant1'
+WPA_OBJECT_PATH = '/fi/w1/wpa_supplicant1'
+
+
+class _WpaSupplicant(
+    DbusInterfaceCommon,
+    interface_name='fi.w1.wpa_supplicant1',
+):
+    '''Minimal proxy for the wpa_supplicant root object.'''
+
+    @dbus_method(
+        input_signature='s',
+        result_signature='o',
+        method_name='GetInterface',
+    )
+    def get_interface(self, ifname: str) -> str:
+        raise NotImplementedError
+
+
+class _WpaInterface(
+    DbusInterfaceCommon,
+    interface_name='fi.w1.wpa_supplicant1.Interface',
+):
+    '''Minimal proxy for a wpa_supplicant managed interface.'''
+
+    @dbus_method(input_signature='s', method_name='Roam')
+    def roam(self, addr: str) -> None:
+        raise NotImplementedError
+
+    @dbus_method(method_name='Reassociate')
+    def reassociate(self) -> None:
+        raise NotImplementedError
+
+    @dbus_property('s', property_name='State')
+    def state(self) -> str:
+        raise NotImplementedError
+
+    @dbus_property('o', property_name='CurrentBSS')
+    def current_bss(self) -> str:
+        raise NotImplementedError
+
+
+class _WpaBSS(
+    DbusInterfaceCommon,
+    interface_name='fi.w1.wpa_supplicant1.BSS',
+):
+    '''Minimal proxy for a scanned BSS.'''
+
+    @dbus_property('ay', property_name='BSSID')
+    def bssid(self) -> bytes:
+        raise NotImplementedError
+
+
+def _normalize_mac(mac: str) -> str:
+    return mac.replace(':', '').replace('-', '').upper()
+
+
+def _normalize_mac_bytes(raw: bytes) -> str:
+    return binascii.hexlify(bytes(raw)).decode('ascii').upper()
+
+
+class _Backend:
+    '''Strategy that applies the selected BSSID to the running radio.'''
+
+    def startup(self) -> None:
+        '''One-time preparation.'''
+
+    def recover(self) -> None:
+        '''Per-iteration step: bring the link back if it dropped.'''
+
+    def apply(self, bssid: str | None, ap_path: str) -> bool:
+        '''Pin (bssid) or release (None) the BSSID.
+
+        Returns False only on a recoverable failure so the caller can retry.
+        '''
+        raise NotImplementedError
+
+    def is_pinned(self, bssid: str) -> bool:
+        '''Whether the radio is currently on the requested BSSID.'''
+        raise NotImplementedError
+
+
+class _NmBackend(_Backend):
+    '''Apply the BSSID by editing and re-activating the NM profile.'''
+
+    def __init__(
+        self,
+        nm: NetworkManager,
+        connection: NetworkConnectionSettings,
+        profile: ConnectionProfile,
+        connection_path: str,
+        device_path: str,
+        device: NetworkDeviceWireless,
+        dry_run: bool,
+    ) -> None:
+        self._nm = nm
+        self._connection = connection
+        self._profile = profile
+        self._connection_path = connection_path
+        self._device_path = device_path
+        self._device = device
+        self._dry_run = dry_run
+        self._wireless: WirelessSettings = profile.wireless  # type: ignore
+
+    def startup(self) -> None:
+        # A single link flap must never permanently block autoconnect, and the
+        # profile must live on disk (not volatile runtime storage) so nothing
+        # gets garbage-collected.
+        if self._dry_run:
+            return
+        self._profile.connection.autoconnect = True
+        self._profile.connection.autoconnect_retries = 0
+        try:
+            _persist_profile(self._connection, self._profile)
+        except SdBusBaseError as error:
+            logger.warning('Initial profile persist failed: %s', error)
+
+    def recover(self) -> None:
+        if self._dry_run:
+            return
+        _recover_device(
+            nm=self._nm,
+            connection=self._connection,
+            profile=self._profile,
+            connection_path=self._connection_path,
+            device_path=self._device_path,
+            device=self._device,
+        )
+
+    def apply(self, bssid: str | None, ap_path: str) -> bool:
+        if bssid is not None:
+            logger.debug('Switch BSSID to: %s', bssid)
+            bssid_bytes = binascii.unhexlify(bssid.replace(':', ''))
+            if self._wireless.bssid == bssid_bytes:
+                return True
+            self._wireless.bssid = bssid_bytes
+        else:
+            logger.debug('Reset BSSID')
+            if self._wireless.bssid is None:
+                return True
+            self._wireless.bssid = None
+
+        if self._dry_run:
+            return True
+        try:
+            # Persist to disk under the existing UUID (idempotent, no duplicate
+            # rows, no volatile churn), then re-activate the device.
+            _persist_profile(self._connection, self._profile)
+            _activate(
+                nm=self._nm,
+                connection_path=self._connection_path,
+                device_path=self._device_path,
+                ap_path=ap_path,
+            )
+            return True
+        except SdBusBaseError as error:
+            # Never let a transient NM/D-Bus failure crash the daemon.
+            logger.warning('Failed to apply BSSID change: %s', error)
+            return False
+
+    def is_pinned(self, bssid: str) -> bool:
+        active_connections = []
+        for path in iter(self._nm.active_connections):
+            try:
+                active_connections.append(
+                    ActiveConnection(path).connection
+                )
+            except SdBusBaseError:
+                # The active connection may vanish between listing and reading
+                # it; skip it rather than crash.
+                pass
+        return self._connection_path in active_connections
+
+
+class _WpaBackend(_Backend):
+    '''Apply the BSSID by asking wpa_supplicant to roam, over D-Bus.
+
+    NetworkManager connection profiles are never modified, so this sidesteps
+    the duplicate-connection / bond-master-teardown / cannot-reactivate
+    problems of the profile-editing path entirely. Requires a wpa_supplicant
+    exposing the D-Bus ``Roam`` method (>= 2.10) on the system bus; NM already
+    runs one for the managed Wi-Fi device. Roam is a one-shot move (not a
+    persistent pin) and only works while associated and when the target BSSID
+    is a known BSS of the current SSID, so we re-apply it every interval.
+    '''
+
+    # States in which the radio is associated or on its way there; we only
+    # nudge a reassociation when it is none of these.
+    _LIVE_STATES = (
+        'associating', 'associated', 'authenticating',
+        '4way_handshake', 'group_handshake', 'completed',
+    )
+
+    def __init__(self, ifname: str, dry_run: bool) -> None:
+        self._dry_run = dry_run
+        supplicant = _WpaSupplicant(WPA_SERVICE_NAME, WPA_OBJECT_PATH)
+        try:
+            iface_path = supplicant.get_interface(ifname)
+        except SdBusBaseError as error:
+            logger.warning(
+                'wpa_supplicant has no interface %s (%s); sleeping...',
+                ifname, error,
+            )
+            _halt()
+        self._iface = _WpaInterface(WPA_SERVICE_NAME, iface_path)
+        logger.info('Using wpa_supplicant interface: %s', iface_path)
+
+    def recover(self) -> None:
+        if self._dry_run:
+            return
+        try:
+            state = self._iface.state
+        except SdBusBaseError as error:
+            logger.warning('Failed to read wpa_supplicant state: %s', error)
+            return
+        if state in self._LIVE_STATES:
+            return
+        logger.info('Reassociating wpa_supplicant (state: %s)', state)
+        try:
+            self._iface.reassociate()
+        except SdBusBaseError as error:
+            logger.warning('wpa_supplicant reassociate failed: %s', error)
+
+    def apply(self, bssid: str | None, ap_path: str) -> bool:
+        if bssid is None:
+            # Nothing to pin; leave the radio where wpa_supplicant put it.
+            return True
+        if self._dry_run:
+            return True
+        try:
+            if self._current_bssid() == _normalize_mac(bssid):
+                return True  # already on the target AP
+            logger.debug('Roam to BSSID: %s', bssid)
+            self._iface.roam(bssid)
+            return True
+        except SdBusBaseError as error:
+            logger.warning('wpa_supplicant Roam failed: %s', error)
+            return False
+
+    def is_pinned(self, bssid: str) -> bool:
+        try:
+            return self._current_bssid() == _normalize_mac(bssid)
+        except SdBusBaseError:
+            return False
+
+    def _current_bssid(self) -> str | None:
+        path = self._iface.current_bss
+        if not path or path == '/':
+            return None
+        raw = _WpaBSS(WPA_SERVICE_NAME, path).bssid
+        return _normalize_mac_bytes(raw)
+
+
 def _main() -> None:
     nm = NetworkManager()
-    connection_path, connection, profile, device = _find_device(nm)
+    connection_path, connection, profile, device_path, device = \
+        _find_device(nm)
 
     logger.info('Load geolocational informations')
     selector = _AccessPointSelector(
@@ -269,56 +641,59 @@ def _main() -> None:
     dry_run = os.environ.get('DRY_RUN', 'false') == 'true'
     interval_secs = float(os.environ.get('INTERVAL_SECS', '30'))
     one_shot = os.environ.get('ONE_SHOT', 'false') == 'true'
+    backend_name = os.environ.get('BACKEND', 'nm').lower()
 
-    def _update_bssid(bssid: str | None) -> None:
-        if bssid is not None:
-            logger.debug('Switch BSSID to: %s', bssid)
-            bssid_bytes = binascii.unhexlify(bssid.replace(':', ''))
-            if wireless.bssid == bssid_bytes:
-                return
-            wireless.bssid = bssid_bytes
-        else:
-            logger.debug('Reset BSSID')
-            if wireless.bssid is None:
-                return
-            wireless.bssid = None
+    if backend_name in ('wpa', 'wpa_supplicant', 'supplicant'):
+        logger.info('Backend: wpa_supplicant (D-Bus)')
+        backend: _Backend = _WpaBackend(device.interface, dry_run)
+    else:
+        logger.info('Backend: NetworkManager')
+        backend = _NmBackend(
+            nm=nm,
+            connection=connection,
+            profile=profile,
+            connection_path=connection_path,
+            device_path=device_path,
+            device=device,
+            dry_run=dry_run,
+        )
 
-        logger.debug('Update wifi profile')
-        if not dry_run:
-            connection.update_profile(profile, save_to_disk=False)
-            nm.activate_connection(
-                connection=connection_path,
-            )
+    backend.startup()
 
     last_bssid = None
     while True:
-        bssids = _find_bssids(device, ssid)
+        # If the link dropped, bring it back without an NM restart.
+        backend.recover()
+
+        try:
+            bssids, bssid_to_ap_path = _find_bssids(device, ssid)
+        except (SdBusBaseError, ValueError) as error:
+            # SdBusBaseError: scan/AP enumeration failed (device down, bus
+            # busy). ValueError: max() over zero matching APs. Either way,
+            # back off and retry next interval instead of crashing.
+            logger.warning('Failed to scan APs: %s', error)
+            sleep(interval_secs)
+            continue
         logger.debug('Detected BSSIDs: %s', repr(bssids))
 
-        # Update BSSID
+        # Select and apply the best BSSID.
         bssid = selector.find(bssids)
-        _update_bssid(bssid)
+        ap_path = bssid_to_ap_path.get(
+            bssid.upper(), '/',
+        ) if bssid is not None else '/'
+        applied = backend.apply(bssid, ap_path)
 
-        # Skip if already changed
+        # Verify / revert (skipped while ONE_SHOT keeps a working pin).
         if not one_shot or bssid is None or last_bssid is None:
-            # Revert on failure
             if bssid is not None:
-                active_connections = []
-                for path in iter(nm.active_connections):
-                    try:
-                        active_connections.append(
-                            ActiveConnection(path).connection
-                        )
-                    except DbusUnknownMethodError:
-                        pass
-                if connection_path in active_connections:
+                if applied and backend.is_pinned(bssid):
                     logger.debug('Succeeded switching BSSID')
                     last_bssid = bssid
                 else:
-                    _update_bssid(None)
+                    backend.apply(None, '/')
                     last_bssid = None
         else:
-            logger.debug('Keeped the original BSSID: %s', last_bssid)
+            logger.debug('Kept the original BSSID: %s', last_bssid)
 
         logger.debug('Waiting for %.02f seconds...', interval_secs)
         sleep(interval_secs)
